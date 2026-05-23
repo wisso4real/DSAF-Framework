@@ -1,0 +1,152 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "dsaf-lab:v1"
+        SONAR_HOST_URL = "http://localhost:9000"
+        SONAR_TOKEN = credentials('sonar-token')
+        SNYK_TOKEN = credentials('snyk-token')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Secrets Scan') {
+            steps {
+                sh '''
+                    gitleaks detect \
+                    --source . \
+                    --report-format json \
+                    --report-path gitleaks-report.json
+                '''
+            }
+        }
+
+        stage('Dependency Scan') {
+            steps {
+                sh '''
+                    snyk auth $SNYK_TOKEN
+
+                    snyk test \
+                    --file=requirements.txt \
+                    --json-file-output=snyk-report.json
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    docker build -t $IMAGE_NAME .
+                    docker images | grep dsaf-lab
+                '''
+            }
+        }
+
+        stage('Container Image Scan') {
+            steps {
+                sh '''
+                    trivy image \
+                    --format json \
+                    --output trivy-report.json \
+                    $IMAGE_NAME
+                '''
+            }
+        }
+
+        stage('Static Application Security Testing') {
+            steps {
+                sh '''
+                    docker run --rm \
+                    --network=host \
+                    -e SONAR_HOST_URL="$SONAR_HOST_URL" \
+                    -e SONAR_TOKEN="$SONAR_TOKEN" \
+                    -v "$PWD:/usr/src" \
+                    sonarsource/sonar-scanner-cli
+                '''
+            }
+        }
+
+        stage('Load Image to Minikube') {
+            steps {
+                sh '''
+                    minikube image load $IMAGE_NAME
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                    kubectl apply -f k8s/rbac.yaml
+                    kubectl apply -f k8s/deployment.yaml
+                    kubectl apply -f k8s/service.yaml
+
+                    kubectl get pods
+                    kubectl get svc
+                '''
+            }
+        }
+
+        stage('Kubernetes Manifest Audit') {
+            steps {
+                sh '''
+                    python3 ~/sli-kube/slikube.py k8s/deployment.yaml > slikube-deployment-report.txt || true
+                    python3 ~/sli-kube/slikube.py k8s/rbac.yaml > slikube-rbac-report.txt || true
+                '''
+            }
+        }
+
+        stage('Kubernetes Benchmark Audit') {
+            steps {
+                sh '''
+                    kubectl delete job kube-bench --ignore-not-found=true
+
+                    kubectl apply -f https://raw.githubusercontent.com/aquasecurity/kube-bench/main/job.yaml
+
+                    sleep 20
+
+                    kubectl logs job/kube-bench > kube-bench-report.txt || true
+
+                    kubectl delete job kube-bench --ignore-not-found=true
+                '''
+            }
+        }
+
+        stage('Dynamic Application Security Testing') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                        chmod +x scripts/zap-scan.sh
+                        ./scripts/zap-scan.sh
+                    '''
+                }
+            }
+
+            post {
+                always {
+                    echo 'OWASP ZAP completed. Findings are reported for remediation and do not block deployment automatically.'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: '*.json,*.txt,*.html', fingerprint: true
+        }
+
+        failure {
+            echo 'Pipeline stopped due to a failed security gate.'
+        }
+
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+    }
+}
