@@ -15,4 +15,4 @@ docker run --rm \
   -J zap-report.json \
   -r zap-report.html || true
 
-echo "OWASP ZAP scan completed. Reports generated: zap-report.json and zap-report.html"
+echo "ZAP scan completed. Reports generated: zap-report.json and zap-report.html"
